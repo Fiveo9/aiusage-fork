@@ -1,6 +1,6 @@
 <script>
   import { dateRange, selectedDevice, selectedTool, formatTokens, formatCost, formatDateTime } from '$lib/stores.js'
-  import { fetchSessions } from '$lib/api.js'
+  import { fetchSessions, sessionDetailUrl } from '$lib/api.js'
   import { createRequestTracker, resolvePage } from '$lib/sessions-paging.js'
   import { t } from '$lib/i18n.js'
   import DateRangeSelector from '$lib/components/DateRangeSelector.svelte'
@@ -61,11 +61,7 @@
   }
 
   function goToDetail(session) {
-    const params = new URLSearchParams()
-    if ($selectedTool) params.set('tool', $selectedTool)
-    if ($selectedDevice) params.set('device', $selectedDevice)
-    const qs = params.toString()
-    window.location.href = `/sessions/${encodeURIComponent(session.sessionId)}${qs ? `?${qs}` : ''}`
+    window.location.href = sessionDetailUrl(session.sessionId, session.deviceInstanceId, $selectedTool)
   }
 </script>
 
@@ -113,7 +109,7 @@
           <!-- svelte-ignore a11y-click-events-have-key-events -->
           <!-- svelte-ignore a11y-no-interactive-element-to-noninteractive-role -->
           <tr class="clickable" on:click={() => goToDetail(session)}>
-            <td class="mono">{formatDateTime(session.ts)}</td>
+            <td class="mono"><a href={sessionDetailUrl(session.sessionId, session.deviceInstanceId, $selectedTool)} on:click|stopPropagation>{formatDateTime(session.ts)}</a></td>
             <td>{session.tool}</td>
             <td class="mono model">{session.model}</td>
             <td class="mono muted">{formatDuration(session.duration)}</td>

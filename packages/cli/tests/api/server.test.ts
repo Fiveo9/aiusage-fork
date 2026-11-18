@@ -987,10 +987,13 @@ describe('Device filtering', () => {
     expect(model.percentage).toBeCloseTo(100, 1)
   })
 
-  it('sessions with other device returns empty', async () => {
+  it('sessions from another device are accessible even before the merged copy exists', async () => {
     const res = await fetch(`${baseUrl}/api/sessions?range=all&device=remote-uuid-0001`)
     const data = await res.json()
-    expect(data.sessions).toEqual([])
+    expect(data.sessions).toHaveLength(1)
+    expect(data.sessions[0]).toMatchObject({ sessionId: 'sessionkey1', deviceInstanceId: 'remote-uuid-0001' })
+    const detail = await fetch(`${baseUrl}/api/sessions/sessionkey1?device=remote-uuid-0001`)
+    expect((await detail.json()).records).toHaveLength(1)
   })
 
   it('projects with no device param returns merged data', async () => {

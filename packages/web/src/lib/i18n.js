@@ -2,6 +2,7 @@ import { writable, derived } from 'svelte/store'
 
 const translations = {
   en: {
+    activity: { device: 'Device', callIndex: 'Call index' },
     nav: {
       home: 'Home',
       overview: 'Overview',
@@ -518,6 +519,7 @@ const translations = {
     },
   },
   zh: {
+    activity: { device: '设备', callIndex: '调用序号' },
     nav: {
       home: '首页',
       overview: '概览',

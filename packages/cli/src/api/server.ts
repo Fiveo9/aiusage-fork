@@ -397,6 +397,26 @@ function getToolTypeFilter(toolType: string | null): string {
 // Rows merged from synced_records carry origin = 'synced' (see db/records.ts LOCAL_RECORDS_WHERE).
 const LOCAL_ONLY_FILTER = `AND ${LOCAL_RECORDS_WHERE}`
 
+function activityPaging(url: URL) {
+  const integer = (key: string, fallback: number) => {
+    const raw = url.searchParams.get(key)
+    if (!raw) return fallback
+    const parsed = Number(raw)
+    return /^\d+$/.test(raw) && Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0
+  }
+  const page = integer('page', 1)
+  const pageSize = Math.min(100, integer('pageSize', 50))
+  const offset = (page - 1) * pageSize
+  return page && pageSize && Number.isSafeInteger(offset) ? { page, pageSize, offset } : null
+}
+
+function activityDeviceFilter(device: string | null, current: string | undefined, owner: string, origin: string) {
+  if (device && device === current) return { where: `AND ${origin} = 'local'`, params: {} }
+  if (device) return { where: `AND ${owner} = @activityDevice`, params: { activityDevice: device } }
+  if (current) return { where: `AND (${origin} = 'local' OR ${owner} != @activityDevice)`, params: { activityDevice: current } }
+  return { where: '', params: {} }
+}
+
 function getDeviceFilter(
   device: string | null | undefined,
   currentDeviceInstanceId: string | undefined,
@@ -775,39 +795,27 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
           byTool[row.tool] = { tokens: row.tokens, cost: row.cost }
         }
 
-        // LEFT JOIN + COALESCE so orphan tool calls (record_id IS NULL) are still
-        // counted. Orphan calls have no records row; for device filtering we treat
-        // them as local (r.device_instance_id IS NULL), and for date/tool we fall
-        // back to tc.ts / tc.tool.
-        const drJoin = getDateRangeFilter(range, from, to, 'r', weekStart)
-        const drJoinO = drJoin.where.replaceAll('r.ts', 'COALESCE(r.ts, tc.ts)')
-        const dfJoinRaw = df.where ? df.where.replace(/device_instance_id/g, 'r.device_instance_id') : ''
-        // Orphan tool calls (record_id IS NULL) are local by definition; include them
-        // when filtering to the current device. Use a word-boundary-safe replace so the
-        // @deviceId param name is not split.
-        const dfJoin = dfJoinRaw.replace(
-          /r\.device_instance_id\s*=\s*@\w+/,
-          '(r.device_instance_id IS NULL OR r.device_instance_id = @deviceId)',
-        )
+        const drJoin = getDateRangeFilter(range, from, to, 'tc', weekStart)
+        const callDevice = activityDeviceFilter(device, options?.currentDeviceInstanceId, 'tc.owner', 'tc.origin')
         const tfJoin = getToolFilter(tool, 'r')
         const tfJoinO = tfJoin.where.replaceAll('r.tool', 'COALESCE(r.tool, tc.tool)')
         const topToolCalls = db.prepare(`
           SELECT tc.name, COUNT(*) AS count
-          FROM tool_calls tc
+          FROM activity_tool_calls tc
           LEFT JOIN records r ON r.id = tc.record_id
-          WHERE 1=1 ${dfJoin} ${drJoinO} ${tfJoinO}
+          WHERE 1=1 ${callDevice.where} ${drJoin.where} ${tfJoinO}
           GROUP BY tc.name ORDER BY count DESC LIMIT 10
-        `).all({ ...drJoin.params, ...df.params, ...tfJoin.params }) as any[]
+        `).all({ ...drJoin.params, ...callDevice.params, ...tfJoin.params }) as any[]
 
         const topMcpServersRaw = db.prepare(`
           SELECT tc.name, COUNT(*) AS count
-          FROM tool_calls tc
+          FROM activity_tool_calls tc
           LEFT JOIN records r ON r.id = tc.record_id
           WHERE tc.name LIKE 'mcp\\_\\_%' ESCAPE '\\'
             AND INSTR(SUBSTR(tc.name, 6), '__') > 0
-            ${dfJoin} ${drJoinO} ${tfJoinO}
+            ${callDevice.where} ${drJoin.where} ${tfJoinO}
           GROUP BY tc.name ORDER BY count DESC
-        `).all({ ...drJoin.params, ...df.params, ...tfJoin.params }) as any[]
+        `).all({ ...drJoin.params, ...callDevice.params, ...tfJoin.params }) as any[]
 
         // Aggregate by server (multiple mcp__server__X tools collapse to one server)
         const mcpServerMap = new Map<string, number>()
@@ -1079,21 +1087,11 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
       }
 
       // ── /api/tool-calls ───────────────────────────────────────────
-      if (url.pathname === '/api/tool-calls') {
+      if (url.pathname === '/api/tool-calls' || url.pathname === '/api/tool-calls/events') {
         const device = url.searchParams.get('device')
-        if (device && device !== options?.currentDeviceInstanceId) {
-          json(res, { toolCalls: [] })
-          return
-        }
+        const df = activityDeviceFilter(device, options?.currentDeviceInstanceId, 'tc.owner', 'tc.origin')
 
-        // Use COALESCE so orphan tool calls (record_id IS NULL, e.g. from ZCode,
-        // Codex backfill) are still counted. They have no matching records row,
-        // so we fall back to tc.ts / tc.tool for filtering.
-        const drRaw = getDateRangeFilter(range, from, to, 'r', weekStart)
-        const dr = {
-          where: drRaw.where.replaceAll('r.ts', 'COALESCE(r.ts, tc.ts)'),
-          params: drRaw.params,
-        }
+        const dr = getDateRangeFilter(range, from, to, 'tc', weekStart)
         const tool = url.searchParams.get('tool')
         const tfRaw = getToolFilter(tool, 'r')
         const tf = {
@@ -1107,20 +1105,40 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
         }
         const ttf = getToolTypeFilter(toolType)
 
+        if (url.pathname.endsWith('/events')) {
+          const paging = activityPaging(url)
+          const name = url.searchParams.get('name')
+          if (!paging || !name) {
+            json(res, { error: { code: 'INVALID_PARAM', message: 'Invalid tool name or pagination' } }, 400)
+            return
+          }
+          const source = `FROM activity_tool_calls tc LEFT JOIN records r ON r.id = tc.record_id
+            WHERE tc.name = @name ${df.where} ${dr.where} ${tf.where} ${ttf}`
+          const params = { ...df.params, ...dr.params, ...tf.params, name }
+          const { total } = db.prepare(`SELECT COUNT(*) AS total ${source}`).get(params) as { total: number }
+          const events = db.prepare(`SELECT tc.id, tc.name, tc.ts, tc.call_index AS callIndex,
+            COALESCE(r.tool, tc.tool) AS tool, tc.record_id AS recordId, r.session_id AS sessionId,
+            COALESCE(tc.owner, @current) AS deviceInstanceId ${source}
+            ORDER BY tc.ts DESC, tc.owner, tc.id LIMIT @pageSize OFFSET @offset`)
+            .all({ ...params, current: options?.currentDeviceInstanceId ?? null, pageSize: paging.pageSize, offset: paging.offset })
+          json(res, { events, total, page: paging.page, pageSize: paging.pageSize })
+          return
+        }
+
         const totalRow = db.prepare(`
-          SELECT COUNT(*) AS total FROM tool_calls tc
+          SELECT COUNT(*) AS total FROM activity_tool_calls tc
           LEFT JOIN records r ON r.id = tc.record_id
-          WHERE 1=1 ${dr.where} ${tf.where} ${ttf}
-        `).get({ ...dr.params, ...tf.params }) as any
+          WHERE 1=1 ${df.where} ${dr.where} ${tf.where} ${ttf}
+        `).get({ ...df.params, ...dr.params, ...tf.params }) as any
         const total = totalRow.total || 1
 
         const rows = db.prepare(`
           SELECT tc.name, COUNT(*) AS count
-          FROM tool_calls tc
+          FROM activity_tool_calls tc
           LEFT JOIN records r ON r.id = tc.record_id
-          WHERE 1=1 ${dr.where} ${tf.where} ${ttf}
+          WHERE 1=1 ${df.where} ${dr.where} ${tf.where} ${ttf}
           GROUP BY tc.name ORDER BY count DESC
-        `).all({ ...dr.params, ...tf.params }) as any[]
+        `).all({ ...df.params, ...dr.params, ...tf.params }) as any[]
 
         const toolCalls = rows.map(r => {
           const type = classifyToolCall(r.name)
@@ -1157,10 +1175,10 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
 
         // Build optional filters
         const toolClause = toolParam ? 'AND tool = @tool' : ''
-        const deviceClause = deviceParam ? 'AND device_instance_id = @device' : ''
-        const filterParams: Record<string, unknown> = { sessionId }
+        const df = activityDeviceFilter(deviceParam, options?.currentDeviceInstanceId, 'device_instance_id', 'origin')
+        const deviceClause = df.where
+        const filterParams: Record<string, unknown> = { sessionId, ...df.params }
         if (toolParam) filterParams.tool = toolParam
-        if (deviceParam) filterParams.device = deviceParam
 
         // Session metadata: one row for the whole session, whatever tools and models it used
         const totals = db.prepare(`
@@ -1175,7 +1193,7 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
                  SUM(thinking_tokens) AS thinkingTokens,
                  SUM(cost) AS cost,
                  COUNT(*) AS recordCount
-          FROM records
+          FROM activity_records
           WHERE session_id = @sessionId ${toolClause} ${deviceClause}
           GROUP BY session_id
         `).get(filterParams) as any
@@ -1183,10 +1201,10 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
         // Models in order of first use; `tool` and `model` stay single values (the first used)
         const modelRows = db.prepare(`
           SELECT tool, model
-          FROM records
+          FROM activity_records
           WHERE session_id = @sessionId ${toolClause} ${deviceClause}
           GROUP BY tool, model
-          ORDER BY MIN(ts) ASC, MIN(rowid) ASC
+          ORDER BY MIN(ts) ASC, MIN(sort_key) ASC
         `).all(filterParams) as any[]
         const meta = totals && {
           sessionId: totals.sessionId,
@@ -1198,7 +1216,7 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
 
         // Fetch cwd from the first record that has one
         const cwdRow = db.prepare(`
-          SELECT cwd FROM records
+          SELECT cwd FROM activity_records
           WHERE session_id = @sessionId AND cwd != '' ${toolClause} ${deviceClause}
           LIMIT 1
         `).get(filterParams) as any
@@ -1218,17 +1236,17 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
                  cache_write_tokens AS cacheWriteTokens,
                  thinking_tokens AS thinkingTokens,
                  cost
-          FROM records
+          FROM activity_records
           WHERE session_id = @sessionId ${toolClause} ${deviceClause}
           ORDER BY ts ASC
         `).all(filterParams) as any[]
 
         // Tool calls for all records in this session
         const rToolClause = toolParam ? 'AND r.tool = @tool' : ''
-        const rDeviceClause = deviceParam ? 'AND r.device_instance_id = @device' : ''
+        const rDeviceClause = activityDeviceFilter(deviceParam, options?.currentDeviceInstanceId, 'r.device_instance_id', 'r.origin').where
         const toolCallRows = db.prepare(`
           SELECT tc.record_id AS recordId, tc.name, tc.ts, tc.call_index AS callIndex
-          FROM tool_calls tc
+          FROM activity_tool_calls tc
           JOIN records r ON r.id = tc.record_id
           WHERE r.session_id = @sessionId ${rToolClause} ${rDeviceClause}
           ORDER BY tc.record_id, tc.call_index ASC
@@ -1291,42 +1309,31 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
 
         const dr = getDateRangeFilter(range, from, to, 'r', weekStart)
         const device = url.searchParams.get('device')
-        const df = getDeviceFilter(device, options?.currentDeviceInstanceId)
+        const df = activityDeviceFilter(device, options?.currentDeviceInstanceId, 'r.device_instance_id', 'r.origin')
         const tool = url.searchParams.get('tool')
 
-        if (device && !df.localOnly && !df.useUnion) {
-          json(res, {
-            sessions: [],
-            total: 0,
-            page,
-            pageSize,
-          })
-          return
-        }
-
         const tf = getToolFilter(tool, 'r')
-        const params: Record<string, unknown> = { ...dr.params, ...tf.params }
+        const params: Record<string, unknown> = { ...dr.params, ...df.params, ...tf.params }
+        const recordFilter = `${dr.where} ${df.where} ${tf.where}`
 
         const totalRow = db.prepare(`
-          SELECT COUNT(DISTINCT r.session_id) AS total
-          FROM records r
-          WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
+          SELECT COUNT(*) AS total FROM (SELECT 1 FROM activity_records r
+          WHERE 1=1 ${recordFilter} GROUP BY r.device_instance_id, r.session_id)
         `).get(params) as any
 
         // Aggregate records per session first: joining tool_calls before the SUMs would count
         // a record once per tool call. Tool calls are then counted for the page's sessions only.
-        const recordFilter = `${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}`
         const sessions = db.prepare(`
-          SELECT s.sessionId, s.tool, s.model, s.ts, s.duration,
+          SELECT s.sessionId, s.deviceInstanceId, s.tool, s.model, s.ts, s.duration,
                  s.inputTokens, s.outputTokens, s.cacheReadTokens, s.cacheWriteTokens, s.cost,
                  (
                    SELECT COUNT(*)
                    FROM records r
-                   JOIN tool_calls tc ON tc.record_id = r.id
-                   WHERE r.session_id = s.sessionId ${recordFilter}
+                   JOIN activity_tool_calls tc ON tc.record_id = r.id
+                   WHERE r.session_id = s.sessionId AND r.device_instance_id = s.deviceInstanceId ${recordFilter}
                  ) AS toolCallCount
           FROM (
-            SELECT r.session_id AS sessionId,
+            SELECT r.session_id AS sessionId, r.device_instance_id AS deviceInstanceId,
                    r.tool,
                    r.model,
                    MIN(r.ts) AS ts,
@@ -1336,13 +1343,13 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
                    SUM(r.cache_read_tokens) AS cacheReadTokens,
                    SUM(r.cache_write_tokens) AS cacheWriteTokens,
                    SUM(r.cost) AS cost
-            FROM records r
+            FROM activity_records r
             WHERE 1=1 ${recordFilter}
-            GROUP BY r.session_id
-            ORDER BY MIN(r.ts) DESC, r.session_id ASC
+            GROUP BY r.device_instance_id, r.session_id
+            ORDER BY MIN(r.ts) DESC, r.session_id ASC, r.device_instance_id
             LIMIT @limit OFFSET @offset
           ) s
-          ORDER BY s.ts DESC, s.sessionId ASC
+          ORDER BY s.ts DESC, s.sessionId ASC, s.deviceInstanceId
         `).all({ ...params, limit: pageSize, offset }) as any[]
 
         json(res, {
@@ -1355,68 +1362,73 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
       }
 
       // ── /api/projects ─────────────────────────────────────────────
-      if (url.pathname === '/api/projects') {
+      if (url.pathname === '/api/projects' || url.pathname === '/api/projects/sessions') {
         const dr = getDateRangeFilter(range, from, to, '', weekStart)
         const device = url.searchParams.get('device')
-        const df = getDeviceFilter(device, options?.currentDeviceInstanceId)
+        const df = activityDeviceFilter(device, options?.currentDeviceInstanceId, 'device_instance_id', 'origin')
         const tool = url.searchParams.get('tool')
         const tf = getToolFilter(tool)
 
-        let rows: any[]
-
-        if (df.where && !df.useUnion) {
-          // Specific other device: query synced_records which now carry source_file and cwd
-          rows = db.prepare(`
-            SELECT source_file, cwd,
-                   COUNT(*) AS sessionCount,
+        const rows = db.prepare(`
+            SELECT source_file, cwd, device_instance_id AS deviceInstanceId, session_id AS sessionId, MIN(ts) AS ts,
                    SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens) AS totalTokens,
                    SUM(cost) AS cost
-            FROM synced_records WHERE 1=1 ${df.where} ${tf.where}
-            GROUP BY source_file ORDER BY totalTokens DESC
-          `).all({ ...df.params, ...tf.params }) as any[]
-        } else {
-          rows = db.prepare(`
-            SELECT source_file, cwd,
-                   COUNT(*) AS sessionCount,
-                   SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens) AS totalTokens,
-                   SUM(cost) AS cost
-            FROM records WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
-            GROUP BY source_file ORDER BY totalTokens DESC
-          `).all({ ...dr.params, ...tf.params }) as any[]
-        }
+            FROM activity_records WHERE 1=1 ${dr.where} ${df.where} ${tf.where}
+            GROUP BY device_instance_id, session_id, source_file, cwd ORDER BY totalTokens DESC
+          `).all({ ...dr.params, ...df.params, ...tf.params }) as any[]
 
         // Build a cwd inference map for Claude Code paths: encoded project dir → cwd.
         // Records without cwd can inherit it from another session in the same project directory.
-        const cwdByEncodedDir: Record<string, string> = {}
+        const cwdByEncodedDir = new Map<string, string>()
         for (const row of rows) {
           if (row.cwd && row.source_file) {
             const m = (row.source_file as string).replace(/\\/g, '/').match(/\.claude\/projects\/([^/]+)/)
-            if (m && !cwdByEncodedDir[m[1]]) cwdByEncodedDir[m[1]] = row.cwd
+            const key = m && JSON.stringify([row.deviceInstanceId, m[1]])
+            if (key && !cwdByEncodedDir.has(key)) cwdByEncodedDir.set(key, row.cwd)
           }
         }
 
         // Aggregate by project
-        const projectMap: Record<string, { sessions: number; tokens: number; cost: number; fullPath: string }> = {}
+        type ProjectSession = { sessionId: string; deviceInstanceId: string; ts: number; tokens: number; cost: number }
+        const projectMap = new Map<string, { sessions: Map<string, ProjectSession>; tokens: number; cost: number; fullPath: string }>()
         for (const row of rows) {
           if (!row.source_file) continue
           let effectiveCwd: string = row.cwd || ''
           if (!effectiveCwd) {
             const m = (row.source_file as string).replace(/\\/g, '/').match(/\.claude\/projects\/([^/]+)/)
-            if (m) effectiveCwd = cwdByEncodedDir[m[1]] || ''
+            if (m) effectiveCwd = cwdByEncodedDir.get(JSON.stringify([row.deviceInstanceId, m[1]])) || ''
           }
           const fromCwd = effectiveCwd ? extractProjectFromCwd(effectiveCwd) : null
           const project = (fromCwd && fromCwd !== 'unknown') ? fromCwd : extractProject(row.source_file)
-          if (!projectMap[project]) projectMap[project] = { sessions: 0, tokens: 0, cost: 0, fullPath: effectiveCwd || row.source_file }
-          projectMap[project].sessions += row.sessionCount
-          projectMap[project].tokens += row.totalTokens
-          projectMap[project].cost += row.cost
+          const group = projectMap.get(project) ?? { sessions: new Map<string, ProjectSession>(), tokens: 0, cost: 0, fullPath: effectiveCwd || row.source_file }
+          const key = JSON.stringify([row.deviceInstanceId, row.sessionId])
+          const session = group.sessions.get(key) ?? { sessionId: row.sessionId, deviceInstanceId: row.deviceInstanceId, ts: row.ts, tokens: 0, cost: 0 }
+          session.ts = Math.min(session.ts, row.ts)
+          session.tokens += row.totalTokens
+          session.cost += row.cost
+          group.sessions.set(key, session)
+          group.tokens += row.totalTokens
+          group.cost += row.cost
+          projectMap.set(project, group)
         }
 
-        const totalTokens = Object.values(projectMap).reduce((s, p) => s + p.tokens, 0) || 1
-        const projects = Object.entries(projectMap)
+        if (url.pathname.endsWith('/sessions')) {
+          const name = url.searchParams.get('name')
+          const paging = activityPaging(url)
+          if (!name || !paging) {
+            json(res, { error: { code: 'INVALID_PARAM', message: 'Invalid project name or pagination' } }, 400)
+            return
+          }
+          const rows = [...(projectMap.get(name)?.sessions.values() ?? [])].sort((left, right) =>
+            right.ts - left.ts || left.deviceInstanceId.localeCompare(right.deviceInstanceId) || left.sessionId.localeCompare(right.sessionId))
+          json(res, { sessions: rows.slice(paging.offset, paging.offset + paging.pageSize), total: rows.length, page: paging.page, pageSize: paging.pageSize })
+          return
+        }
+        const totalTokens = [...projectMap.values()].reduce((sum, project) => sum + project.tokens, 0) || 1
+        const projects = [...projectMap]
           .map(([name, data]) => ({
             name,
-            sessions: data.sessions,
+            sessions: data.sessions.size,
             tokens: data.tokens,
             cost: data.cost,
             percentage: Math.round((data.tokens / totalTokens) * 1000) / 10,

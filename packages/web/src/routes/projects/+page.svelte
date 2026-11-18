@@ -1,6 +1,6 @@
 <script>
   import { dateRange, selectedDevice, selectedTool, formatTokens, formatCost, formatNumber } from '$lib/stores.js'
-  import { fetchProjects } from '$lib/api.js'
+  import { fetchProjects, activityDetailUrl } from '$lib/api.js'
   import { t } from '$lib/i18n.js'
   import DateRangeSelector from '$lib/components/DateRangeSelector.svelte'
   import DeviceSelector from '$lib/components/DeviceSelector.svelte'
@@ -53,10 +53,11 @@
 {:else}
   <div class="ranking">
     {#each data.projects as proj, i}
-      <div class="row animate-row">
+      <a class="row animate-row" href={activityDetailUrl('/projects/sessions', { ...$dateRange, device: $selectedDevice, tool: $selectedTool, name: proj.name })}>
         <span class="rank mono">#{i + 1}</span>
         <span class="name mono" title={proj.fullPath || proj.name}>
           {proj.name}
+          <span class="path">{$t('projects.sessions')}: {formatNumber(proj.sessions)}</span>
           {#if proj.fullPath && proj.fullPath !== proj.name}
             <span class="path">{proj.fullPath}</span>
           {/if}
@@ -67,7 +68,7 @@
         <span class="tokens mono">{formatTokens(proj.tokens)}</span>
         <span class="cost mono accent">{formatCost(proj.cost)}</span>
         <span class="pct mono">{proj.percentage.toFixed(1)}%</span>
-      </div>
+      </a>
     {/each}
   </div>
 {/if}

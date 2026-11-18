@@ -39,10 +39,12 @@ import {
 import { classifyPulledRecord, namespaceOwnerFromPath } from './ownership.js'
 import { listedOwners, planNamespaceRead, readNamespaceFiles, type NamespaceReadPlan } from './snapshot.js'
 import type { SyncProgress } from './runtime.js'
+import { syncToolCallSnapshots } from './tool-call-snapshot.js'
 
 export { contentDigest, parseSyncRecordLine, serializeSnapshot } from './manifest.js'
 
 export interface SyncBackend {
+  readonly supportsToolCalls?: boolean
   /**
    * Content of `path`, or `null` only when the file is confirmed absent.
    * Every other failure (permissions, I/O, corrupt cache) must throw: the
@@ -140,6 +142,7 @@ export function parseNdjson(content: string): Map<string, SyncRecord> {
 }
 
 export interface LocalSnapshot {
+  wireIds: Map<string, string>
   /** Wire records keyed by id, one per local record (collisions resolved to the newest). */
   records: Map<string, SyncRecord>
   /** Local records that lost a wire-id collision. */
@@ -176,7 +179,7 @@ export function buildLocalSnapshot(db: Database.Database, deviceInstanceId: stri
     losers.set(wire.id, list)
   }
   const collisions = Array.from(losers.entries()).map(([wireId, recordIds]) => ({ wireId, recordIds }))
-  return { records, collisions }
+  return { records, collisions, wireIds: new Map(Array.from(winnerLocalId, ([wire, local]) => [local, wire])) }
 }
 
 export class SyncOrchestrator {
@@ -500,6 +503,9 @@ export class SyncOrchestrator {
     // ahead of this machine's clock. The acknowledgement is therefore never
     // below the newest version this upload published.
     const publishedAt = unsynced.reduce((at, r) => Math.max(at, r.updatedAt), Date.now())
+    if (this.backend.supportsToolCalls) {
+      writtenFiles += await syncToolCallSnapshots(this.db, this.backend, target, deviceInstanceId, allPaths, digests, snapshot.wireIds)
+    }
     markRecordsSynced(this.db, unsynced.map(r => r.id), publishedAt, target)
     clearRetiredWireIds(this.db, target)
 

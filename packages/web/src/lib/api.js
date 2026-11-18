@@ -94,6 +94,18 @@ export async function fetchProjects(params) {
   return apiFetch(buildUrl('/api/projects', params))
 }
 
+export function activityDetailUrl(path, params) {
+  return buildUrl(path, params)
+}
+
+export function sessionDetailUrl(sessionId, device, tool) {
+  return buildUrl(`/sessions/${encodeURIComponent(sessionId)}`, { device, tool })
+}
+
+export function fetchActivityDetail(kind, params) {
+  return apiFetch(buildUrl(kind === 'project' ? '/api/projects/sessions' : '/api/tool-calls/events', params))
+}
+
 export async function refreshData() {
   return apiFetch('/api/refresh', { method: 'POST' })
 }

@@ -233,6 +233,8 @@ export function getBookkeepingTargets(db: Database.Database): string[] {
     SELECT DISTINCT target FROM sync_record_claims
     UNION
     SELECT DISTINCT target FROM sync_namespace_verdicts
+    UNION
+    SELECT DISTINCT target FROM synced_tool_calls
     ORDER BY 1
   `).all() as Array<{ target: string }>
   return rows.map(r => r.target)
@@ -275,6 +277,7 @@ export function forgetSyncTargetBookkeeping(db: Database.Database, target: strin
     // Identified while the claims still exist; identical to "no claim left
     // after the delete" because only `target`'s claims go.
     const lastClaimRows = db.prepare(`UPDATE synced_records SET unclaimed_since = @tick WHERE ${LAST_CLAIM_WHERE}`).run({ target, tick }).changes
+    db.prepare('DELETE FROM synced_tool_calls WHERE target = ?').run(target)
     const counts: SyncTargetBookkeeping & { tick: number } = { claimRows: 0, verdictRows: 0, syncStateRows: 0, retiredWireIdRows: 0, lastClaimRows, tick }
     for (const { table, key } of TARGET_KEYED_TABLES) {
       counts[key] = db.prepare(`DELETE FROM ${table} WHERE target = ?`).run(target).changes

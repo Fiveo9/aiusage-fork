@@ -1,8 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import http from 'node:http'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import Database from 'better-sqlite3'
 import { createApiServer } from '../../src/api/server.js'
 import { initializeDatabase } from '../../src/db/index.js'
@@ -55,14 +52,12 @@ function insertToolCalls(db: Database.Database, recordId: string, count: number,
 }
 
 describe('sessions endpoints', () => {
-  let dir: string
   let db: Database.Database
   let server: http.Server
   let baseUrl: string
 
   beforeEach(async () => {
-    dir = mkdtempSync(join(tmpdir(), 'aiusage-sessions-endpoints-'))
-    db = new Database(join(dir, 'cache.db'))
+    db = new Database(':memory:')
     initializeDatabase(db)
     server = createApiServer(db)
     await new Promise<void>((resolve) => {
@@ -77,7 +72,6 @@ describe('sessions endpoints', () => {
   afterEach(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()))
     db.close()
-    rmSync(dir, { recursive: true, force: true })
   })
 
   async function getJson(path: string): Promise<{ status: number; body: any }> {
@@ -164,7 +158,7 @@ describe('sessions endpoints', () => {
       expect(body.sessions[0]).toMatchObject({ inputTokens: 100, cost: 1, toolCallCount: 2 })
     })
 
-    it('leaves records merged from other devices out of the totals and the tool-call count', async () => {
+    it('separates same-id sessions by device, including their tool-call counts', async () => {
       await new Promise<void>((resolve) => server.close(() => resolve()))
       server = createApiServer(db, { currentDeviceInstanceId: 'local-uuid-0000' })
       await new Promise<void>((resolve) => {
@@ -179,12 +173,15 @@ describe('sessions endpoints', () => {
       insertToolCalls(db, 'l1', 2)
       insertToolCalls(db, 'm1', 7)
 
-      for (const query of ['', '&device=local-uuid-0000']) {
-        const { body } = await getJson(`/api/sessions?range=all${query}`)
-
-        expect(body.total).toBe(1)
-        expect(body.sessions[0]).toMatchObject({ sessionId: 's1', inputTokens: 100, cost: 1, duration: 0, toolCallCount: 2 })
-      }
+      const { body: all } = await getJson('/api/sessions?range=all')
+      expect(all.total).toBe(2)
+      expect(all.sessions.map((session: any) => session.inputTokens)).toEqual([900, 100])
+      const { body: local } = await getJson('/api/sessions?range=all&device=local-uuid-0000')
+      expect(local.sessions).toHaveLength(1)
+      expect(local.sessions[0]).toMatchObject({ sessionId: 's1', inputTokens: 100, toolCallCount: 2 })
+      const { body: remote } = await getJson('/api/sessions?range=all&device=other-uuid')
+      expect(remote.sessions).toHaveLength(1)
+      expect(remote.sessions[0]).toMatchObject({ sessionId: 's1', inputTokens: 900, toolCallCount: 7 })
     })
 
     it('pages over sessions, not over joined tool-call rows', async () => {
@@ -324,7 +321,7 @@ describe('sessions endpoints', () => {
       expect(body).toMatchObject({ sessions: [], total: 3, page: 3, pageSize: 2 })
     })
 
-    it('validates before the other-device shortcut', async () => {
+    it('validates pagination for other devices', async () => {
       await new Promise<void>((resolve) => server.close(() => resolve()))
       server = createApiServer(db, { currentDeviceInstanceId: 'local-uuid-0000' })
       await new Promise<void>((resolve) => {

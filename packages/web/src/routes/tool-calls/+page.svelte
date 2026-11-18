@@ -1,6 +1,6 @@
 <script>
   import { dateRange, selectedDevice, selectedTool, formatNumber } from '$lib/stores.js'
-  import { fetchToolCalls } from '$lib/api.js'
+  import { fetchToolCalls, activityDetailUrl } from '$lib/api.js'
   import { t } from '$lib/i18n.js'
   import DateRangeSelector from '$lib/components/DateRangeSelector.svelte'
   import DeviceSelector from '$lib/components/DeviceSelector.svelte'
@@ -106,7 +106,7 @@
 {:else}
   <div class="ranking">
     {#each data.toolCalls as tc, i}
-      <div class="row animate-row">
+      <a class="row animate-row" href={activityDetailUrl('/tool-calls/events', { ...$dateRange, device: $selectedDevice, tool: $selectedTool, toolType: selectedType, name: tc.name })}>
         <span class="rank mono">#{i + 1}</span>
         <span class="name mono">
           {tc.displayName}
@@ -121,7 +121,7 @@
         </div>
         <span class="count mono">{formatNumber(tc.count)}</span>
         <span class="pct mono">{tc.percentage.toFixed(1)}%</span>
-      </div>
+      </a>
     {/each}
   </div>
 {/if}

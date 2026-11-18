@@ -1,5 +1,6 @@
 import { S3Client, GetObjectCommand, PutObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectCommand, DeleteObjectsCommand } from '@aws-sdk/client-s3'
 import { normalizeS3Prefix } from './target.js'
+import { isToolCallPath } from './tool-call-snapshot.js'
 
 export interface S3Config {
   bucket: string
@@ -11,6 +12,7 @@ export interface S3Config {
 }
 
 export class S3SyncBackend {
+  readonly supportsToolCalls = true
   private client: S3Client
   private bucket: string
   private prefix: string
@@ -58,7 +60,7 @@ export class S3SyncBackend {
       Bucket: this.bucket,
       Key: key,
       Body: content,
-      ContentType: 'application/x-ndjson',
+      ContentType: isToolCallPath(path) ? 'application/json' : 'application/x-ndjson',
     })
     await this.client.send(command)
   }
@@ -66,7 +68,7 @@ export class S3SyncBackend {
   async listFiles(): Promise<string[]> {
     const files: string[] = []
     for (const entry of await this.listEntries()) {
-      if (entry.path.endsWith('.ndjson') || /^[^/]+\/manifest\.json$/.test(entry.path)) files.push(entry.path)
+      if (entry.path.endsWith('.ndjson') || isToolCallPath(entry.path) || /^[^/]+\/manifest\.json$/.test(entry.path)) files.push(entry.path)
     }
     return files.sort()
   }
@@ -80,7 +82,7 @@ export class S3SyncBackend {
   async listFileDigests(): Promise<Map<string, string>> {
     const digests = new Map<string, string>()
     for (const entry of await this.listEntries()) {
-      if (!entry.path.endsWith('.ndjson')) continue
+      if (!entry.path.endsWith('.ndjson') && !isToolCallPath(entry.path)) continue
       const etag = entry.etag?.replace(/^"|"$/g, '')
       if (etag && /^[0-9a-f]{32}$/i.test(etag)) digests.set(entry.path, etag.toLowerCase())
     }
@@ -190,6 +192,6 @@ export class S3SyncBackend {
       }
     }
 
-    return files.filter(f => f.endsWith('.ndjson')).length
+    return files.filter(f => f.endsWith('.ndjson') || isToolCallPath(f)).length
   }
 }

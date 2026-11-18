@@ -149,7 +149,7 @@ export function buildConsentConfig(config: Config): ConsentConfig | null {
     target,
     endpoint,
     region,
-    fields: SYNC_FIELDS,
+    fields: backend === 's3' ? [...SYNC_FIELDS, 'toolCalls(id,recordId,tool,name,ts,callIndex)'] : SYNC_FIELDS,
     operations: ['read', 'write'],
     schemaVersion: 'v1',
   }
